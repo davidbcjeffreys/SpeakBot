@@ -1,0 +1,17 @@
+<launch>
+  <!-- start transcription node -->
+  <!-- <include file="$(find speakbot)/launch/transcription.launch">
+  </include> -->
+  
+  <!-- start object identification node -->
+  <include file="$(find object_identification_pkg)/launch/ultralytics.launch">
+  </include>
+  
+  <!-- start Gazebo node -->
+  <include file="$(find turtlebot3_gazebo)/launch/turtlebot3_world.launch">
+  </include>
+  
+  <!-- start navigation node -->
+  <include file="$(find turtlebot3_manipulation_navigation)/launch/navigation.launch">
+  </include>
+</launch>

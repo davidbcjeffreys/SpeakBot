@@ -1,0 +1,4 @@
+<launch>
+  <!-- launch ultralytics node -->
+  <node pkg="object_identification_pkg" type="Ultralytics.py" name="SpeakBot_Ultralytics" />
+</launch>
