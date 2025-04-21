@@ -12,59 +12,74 @@ import rospy
 import pyaudio
 import wave
 import sys
-import whisper
 import copy
 import re
-import numpy as np
 import actionlib
 import moveit_commander
 import threading
 import statistics as stats
 import tf
+import os
+import openai
+from dynamic_reconfigure.client import Client
 from moveit_commander import MoveGroupCommander
 from gazebo_msgs.srv import GetModelState, GetModelStateRequest, GetModelStateResponse
-from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, PoseWithCovariance
+from move_base_msgs.msg import MoveBaseGoal, MoveBaseAction
+from geometry_msgs.msg import PoseStamped, Pose, PoseWithCovarianceStamped
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import LaserScan
 
-# import openai
-
 # !!!!!!!!!! REMINDER TO UPDATE PACKAGE.XML FOR THE ABOVE DEPENDENCIES !!!!!!!!!!  #
 
-# OPENAT_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAT_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# move_group 'group's and global frame declarations
-GLOBAL_FRAME = "world"
+# move_group group's and global frame declarations
+GLOBAL_FRAME = "map"
+NAVIGATION_FRAME = "odom"
 GROUP_ARM = "arm"
 GROUP_GRIPPER = "gripper"
 
 # move_group trajectory waypoint parameters. EE chain and link to base link offsets also declared for
 # navigation of mobile base.
-EE_TO_GRIPPERLINK_DIST = 0.075
+EE_TO_GRIPPERLINK_DIST = 0.05
 LINK1_TO_BASEINK_DIST = 0.091
 GOAL_POSITION_TOLERANCE = 0.005
 ARM_TRAJECTORY_WAYPOINT_STEP = 0.01
 
 # Gripper states
-ENTRY = 0
-ORIENT = 1
-DESCEND = 2
-OBTAIN = 3
-ASCEND = 4
-RELEASE = 5
+PREP = 0
+ENTRY = 1
+ORIENT = 2
+DESCEND = 3
+OBTAIN = 4
+ASCEND = 5
+RETURN = 6
+RELEASE = 7
 
 # Joint configurations
 HOME_CONFIG = [0.0, -1.0, 0.3, 0.7]
-RELEASE_CONFIG = [1.575, 0.0, 0.0, 0.0]
+RIGHT_PICKUP = [-1.575, -1.0, 0.3, 0.7]
+LEFT_PICKUP = [1.575, -1.0, 0.3, 0.7]
+RELEASE_CONFIG = [1.575, 0.893, -0.63, 1.28]
 TRANSIT_CONFIG = [0.0, -0.47, 0.06, 1.97]
 GRIPPER_CLOSE = [-0.01, 0.0]
 GRIPPER_OPEN = [0.01, 0.0]
 
+# Audio prerequisites
+FORMAT = pyaudio.paInt16                                    # Suitable bit depth for processing audio files - matches audio bit depth used in CDs, without larger memory usage of 24/32 bit depths.
+CHANNELS = 1                                                # Number of channels irrelevant in this application, simply set to mono.
+RATE = 48000
+FRAMES_PER_BUFFER = 1024
+
 actionVerb = {
-    "Get": ("Bring", "Find", "Fetch", "Give", "Hand", "Grab", "Pick", "bring", "find", "fetch", "give", "hand", "grab")
+    "Get": ("Bring", "Find", "Fetch", "Give", "Hand", "Grab", "Pick", "Get", "bring", "find", "fetch", "give", "hand", "grab", "pick", "get")
 }
-actionNoun_info = {                                                 # Dictionary values may need to be altered into a list instead of a tuple to allow for modification in a dynamic map.
+
+hotword_prompt = {
+    "Hello Speaker" : ("Hello Speaker", "Hello speaker", "hello speaker")
+}
+
+actionNoun_info = {                                         # Dictionary values may need to be altered into a list instead of a tuple to allow for modification in a dynamic map.
     "red block"          : [], 
     "green block"        : [],
     "blue block"         : [],
@@ -80,28 +95,27 @@ class GetInstruction:
     def __init__(self):
         self.hotword_detected = False
         self.find_action = False
+        self.listening_count = 0
+        self.hotword_dict = hotword_prompt.get("Hello Speaker")
+        try:
+            self.doc = open("Summarisation_Layer.html", "x")
+        except:
+            pass
 
     def RecordAudio(self):
-        print("What would you like me to do?")
+        rospy.loginfo("What would you like me to do?")
+
 
 # Parameter setup for audio manipulation
-        
-        FORMAT = pyaudio.paInt16                                    # Suitable bit depth for processing audio files - matches audio bit depth used in CDs, without larger memory usage of 24/32 bit depths.
-        CHANNELS = 1                                                # Number of channels irrelevant in this application, simply set to mono.
         if self.hotword_detected:
             seconds = 5
-            RATE = 24000
-            FRAMES_PER_BUFFER = 3200
             self.hotword_detected = False
             self.find_action = True
         else:
             seconds = 2
-            RATE = 24000
-            FRAMES_PER_BUFFER = 3200
-
         p = pyaudio.PyAudio()
 
-        stream = p.open(                                            # Initialisation of the parameters within the 'p' object of the PyAudio class.
+        stream = p.open(                                                # Initialisation of the parameters within the 'p' object of the PyAudio class.
             format = FORMAT,
             channels = CHANNELS,
             rate = RATE,
@@ -109,48 +123,131 @@ class GetInstruction:
             frames_per_buffer=FRAMES_PER_BUFFER
         )
 
-        obj = wave.open("Output.wav", "wb")                         # Create an object to save the .wav sample in a wave file. The file is set to 'write binary' for the allocatation of th frames list into the file.
-        obj.setnchannels(CHANNELS)
-        obj.setsampwidth(p.get_sample_size(FORMAT))
-        obj.setframerate(RATE)
+        with wave.open("Output.wav", "wb") as obj:                      # Create an object to save the .wav sample in a wave file. The file is set to 'write binary' for the allocatation of th frames list into the file.
+            obj.setnchannels(CHANNELS)
+            obj.setsampwidth(p.get_sample_size(FORMAT))
+            obj.setframerate(RATE)
 
-        for _ in range (0, int(RATE/FRAMES_PER_BUFFER*seconds)):    # Iterate through the frames list, filling up each element every second.
-            data = stream.read(FRAMES_PER_BUFFER)                   # Number of frames per buffer stated on line 4 read per each iteration of the for loop. Returns a byte value.
-            obj.writeframes(data)
+            for _ in range (0, int(RATE/FRAMES_PER_BUFFER*seconds)):    # Iterate through the frames list, filling up each element every second.
+                data = stream.read(FRAMES_PER_BUFFER)                   # Number of frames per buffer stated on line 4 read per each iteration of the for loop. Returns a byte value.
+                obj.writeframes(data)
 
-        obj.close() 
+            obj.close() 
         stream.stop_stream()
         stream.close()
-        p.terminate()                                               # Releases all the PortAudio resources.
-        UserCommand.ConvertAudio()
+        p.terminate()                                                   # Releases all the PortAudio resources.
+        UserCommand.TranscribeAudio()
 
-    def ConvertAudio(self):
-        result = whisper_model.transcribe("Output.wav", no_speech_threshold=0.75, logprob_threshold=-3.0)
-        result = result["text"]
-        result = (result.replace(",",""))
-        result = result.strip(" .")
-        result_period = tuple(result.split())
-
-        if self.find_action:
-            GoalAction.movetotarget(result, result_period)      
+    def TranscribeAudio(self):
+        self.listening_count += 1
+        with open("Output.wav", "rb") as input_audio:
+            self.transcription = openai.Audio.transcribe(
+                file = input_audio,
+                model = "whisper-1",
+                response_format = "text",
+                language = "en"
+            )
+            print(self.transcription)
+        self.transcription = (self.transcription.replace(",",""))
+        self.transcription = self.transcription.strip(" .")
+        
         try:
-            hotword = re.search("\AHey speaker", result)
-            if hotword.group() == "Hey speaker":
-                print("LISTENING")
+            self.hotword = re.search("\AHello Speaker|\AHello speaker|\Ahello speaker", self.transcription)
+            if self.hotword.group() in self.hotword_dict:
+                ControlArm.move_gripper.go(GRIPPER_CLOSE, wait=True)
+                ControlArm.move_gripper.go(GRIPPER_OPEN, wait=True)
+                ControlArm.move_gripper.stop()
+                ControlArm.move_gripper.clear_pose_targets()
+                rospy.loginfo("LISTENING")
                 self.hotword_detected = True
+                self.RecordAudio()
         except:
             pass
-            
+
+        if self.find_action is True:
+            self.find_action = False
+            self.SummariseRequest(self.transcription)
+
+    def SummariseRequest(self, request):
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "A user is asking a robot to pick up an object, the input text is a request from the user. Identify the main request that the user makes(for example, pick up the red block) and also rate how urgent the text is (1= not urgent, 10 = very urgent."},
+                {"role": "user", "content": request}
+            ]
+        )
+        summary = response["choices"][0]["message"]["content"]
+        summary = summary.splitlines()
+        split_summary = []
+        for text in summary:
+            if ": " in text:
+                _,text = text.rsplit(": ", 1)
+                split_summary.append(text.strip())
+        
+        split_summary[1] = int(split_summary[1])
+
+        if split_summary[1] >= 8:
+            self.reconfigure_params_fast()
+        else:
+            self.reconfigure_params_norm()
+
+        self.final_request_str = split_summary[0]
+        self.final_request_tupl = tuple(self.final_request_str.split())
+
+        # with open("Summarisation_Layer.html", "a") as doc:
+        #     doc.write("<p style='color:rgb(0, 0, 83);'>Input audio category: Bkgrd Noise (Normal)</p>")
+        #     doc.write("<p style='color:rgb(0, 0, 83);'>Input audio approx distance: 1.0</p>")
+        #     doc.write(f"<p style='color:rgb(0, 0, 83);'>Number of re-listens required: {self.listening_count}</p>")
+        #     doc.write(f"<p style='color:gray;'>Input Transcription: {self.transcription}</p>")
+        #     doc.write(f"<p style='color:red;'>Response: {self.final_request_str}</p>")
+        #     doc.write(f"<p style='color:red;'>Urgency: {split_summary[1]}</p>\n")
+        #     doc.write("<br>\n")
+        #     doc.close()
+        
+        # self.start_time = rospy.Time.now().secs
+        GoalAction.movetotarget(self.final_request_str, self.final_request_tupl)
+
+    def reconfigure_params_fast(self):
+        DWAPlanner_client = Client("/move_base/DWAPlannerROS")
+        DWAparams = {
+            "xy_goal_tolerance" : 0.075,
+            "yaw_goal_tolerance" : 0.17,
+            "path_distance_bias" : 64,
+            "max_vel_trans" : 0.26,
+        }
+        inflation_layer_client = Client("/move_base/local_costmap/inflation_layer")
+        inflation_params = {
+            "cost_scaling_factor" : 4
+        }
+        DWAPlanner_client.update_configuration(DWAparams)
+        inflation_layer_client.update_configuration(inflation_params)
+
+    def reconfigure_params_norm(self):
+        DWAPlanner_client = Client("/move_base/DWAPlannerROS")
+        DWAparams = {
+            "xy_goal_tolerance" : 0.05,
+            "yaw_goal_tolerance" : 0.07,
+            "path_distance_bias" : 16,
+            "max_vel_trans" : 0.18,
+        }
+        inflation_layer_client = Client("/move_base/local_costmap/inflation_layer")
+        inflation_params = {
+            "cost_scaling_factor" : 4
+        }
+        DWAPlanner_client.update_configuration(DWAparams)
+        inflation_layer_client.update_configuration(inflation_params)
+
 class Navigate:
     def __init__(self):
         rospy.wait_for_service("/gazebo/get_model_state")
         self.targetobj_1 = rospy.ServiceProxy("/gazebo/get_model_state", GetModelState)
-        self.amcl_reading = PoseWithCovariance()
         self.wafflepose_locate = PoseStamped()
         self.amcl_poses = [0.0, 0.0]
         self.x_offset = 0.0
         self.y_offset = 0.0
         self.home_iteration = False
+        self.request_options = actionVerb.get("Get")
+        self.running_status = False
 
         # Command string and command tuple for testing without audio
         # self.result_string = "Pick up the blue block"
@@ -173,15 +270,14 @@ class Navigate:
             response = GetModelStateResponse()
             
             request.model_name = target
-            request.relative_entity_name = "world"
-            
+            request.relative_entity_name = GLOBAL_FRAME
+
             # Get the model state
             response = self.targetobj_1(request)
             
             # Store the response (pose and orientation) in the dictionary
             responses[target] = {
                 'pose': response.pose.position,
-                'orientation': response.pose.orientation
             }
 
         # Access the pose and orientation for each model
@@ -189,45 +285,40 @@ class Navigate:
         bluebox_pose = responses["blue_box"]['pose']
         greenbox_pose = responses["green_box"]['pose']
 
-        redbox_orientation = responses["red_box"]['orientation']
-        bluebox_orientation = responses["blue_box"]['orientation']
-        greenbox_orientation = responses["green_box"]['orientation']
-
         actionNoun_info["red block"] = [
             round(redbox_pose.x, 6),
             round(redbox_pose.y, 6),
-            round(redbox_orientation.z, 6)
+            round(redbox_pose.z, 6)
         ]
 
         actionNoun_info["blue block"] = [
             round(bluebox_pose.x, 6),
             round(bluebox_pose.y, 6),
-            round(bluebox_orientation.z, 6)
+            round(bluebox_pose.z, 6)
         ]
 
         actionNoun_info["green block"] = [
             round(greenbox_pose.x, 6),
             round(greenbox_pose.y, 6),
-            round(greenbox_orientation.z, 6)
+            round(greenbox_pose.z, 6)
         ]
 
     def movetotarget(self, result, result_period):
-        actual_request = actionVerb.get("Get")
+    # Directs the Waffle Pi to thetarget object pose
         # Acquire initial home pose position for object returns upon initialization
-        if self.home_iteration is False:
+        if not self.home_iteration:
             self.home_pose = self.amcl_poses
-            print(self.home_pose)
             self.home_iteration = True
-        for i in result_period:
-            if i in actual_request:
+        for word in result_period:
+            if word in self.request_options:
                 try:
-                    self.matched_object = re.search(r"(\bred|\bblue|\bgreen)\s(\bblock)", result)
+                    self.matched_object = re.search(r"(\bred|\bblue|\bgreen)\s(\bblock)", result)     # tweak pattern adherance to remove the whitespace at the end of the string
                 except Exception as error:
                     rospy.logerr(f"Invalid arm location request: {error}")
                     break
                 if self.matched_object:
                     self.matched_object = self.matched_object.group()
-                    rospy.sleep(1.5)                                        # The /amcl_pose topic publishes at a low frequency of around 0.66Hz. Unless there is a way to adjust this publishing frequency, a rudimentary 'buffer' must be implemented - a timer to allow the callback function to acquire the value.
+                    rospy.sleep(2.0)                                        # Once initiated, the /amcl_pose topic publishes at a low frequency of approx. 0.66Hz. Unless there is a way to adjust this publishing frequency, a rudimentary 'buffer' must be implemented - a timer to allow the callback function to acquire the value.
                     if self.matched_object in actionNoun.keys():
                         self.orient_vals = self.base_orient()
                         self.wafflepose_locate.pose.position.x = actionNoun_info[self.matched_object][0] + self.orient_vals[0]
@@ -235,22 +326,26 @@ class Navigate:
                         self.wafflepose_locate.pose.orientation.z = self.orient_vals[1]
                         self.wafflepose_locate.pose.orientation.w = self.orient_vals[2]
                         self.wafflepose_locate.header.stamp = rospy.Time.now()
-                        self.wafflepose_locate.header.frame_id = "world"
+                        self.wafflepose_locate.header.frame_id = "map"
 
                         self.wafflepose = MoveBaseGoal()
                         self.wafflepose.target_pose = self.wafflepose_locate
                         base_client.send_goal(self.wafflepose)
+                        self.running_status = True
+                        print(self.wafflepose.target_pose.pose)
                         if base_client.wait_for_result():
                             base_client.cancel_goal()
-                            self.wafflepose.target_pose = None
-                        print("TARGET REACHED")
-                        #ControlArm.grabObject(self.matched_object)
-                        self.movetohome()
+                            self.wafflepose.target_pose = None                            
+                        rospy.loginfo("TARGET OBJECT REACHED")
+                        ControlArm.grabObject(self.matched_object)
+            else:
+                UserCommand.find_action = False
 
     def movetohome(self):
+    # Directs the Waffle Pi to the home/initial pose.
         self.home_goal = MoveBaseGoal()
         self.home_target = PoseStamped()
-        self.home_target.header.frame_id = "world"
+        self.home_target.header.frame_id = "map"
         self.home_target.header.stamp = rospy.Time.now()
         self.home_target.pose.position.x = self.home_pose[0]
         self.home_target.pose.position.y = self.home_pose[1]
@@ -260,9 +355,12 @@ class Navigate:
         if base_client.wait_for_result():
             base_client.cancel_goal()
             self.wafflepose.target_pose = None
-        print("TASK COMPLETE")
+        rospy.loginfo("TASK COMPLETE")
+        UserCommand.find_action = False
 
     def base_orient(self):
+    # Orientates the Waffle Pi based on current positional error between the mobile base and the target.
+    # item with respect to the x axis.
         if self.x_error > 0:
             self.x_location = LINK1_TO_BASEINK_DIST
             self.z_orient = 0.0
@@ -275,20 +373,24 @@ class Navigate:
         return self.x_location, self.z_orient, self.w_orient
     
     def get_AMCL_pose(self, lidar_val):
-        # Calibrates the AMCL position of the Waffle Pi.
-        while self.home_iteration is False:
-            amcl_reading = lidar_val.pose
-            self.amcl_poses[0] = amcl_reading.pose.position.x
-            self.amcl_poses[1] = amcl_reading.pose.position.y
+        if not self.running_status:
+            rospy.logdebug("AMCL ACTIVATED")
+        # Calibrates the AMCL position of the Waffle Pi prior to initial movement.
+            if self.home_iteration is False:
+                amcl_pose = lidar_val.pose
+                self.amcl_poses[0] = amcl_pose.pose.position.x
+                self.amcl_poses[1] = amcl_pose.pose.position.y
 
-        # Error checking is undertaken between the Pi pose and the assumed 
-        # object pose within the global frame, setting an offset for the
-        # target object pose.
-        if hasattr(self, "matched_object"):
-            self.x_error = (actionNoun_info[GoalAction.matched_object][0]-self.amcl_poses[0])
-            self.y_error = (actionNoun_info[GoalAction.matched_object][1]-self.amcl_poses[1])
-            self.y_offset = -0.275 if self.y_error > 0.0 else 0.275
-        rospy.sleep(0.25)
+            rospy.logdebug("AMCL RUNNING")
+            # Error checking is undertaken between the Pi pose and the assumed 
+            # object pose within the global frame, setting an offset for the
+            # target object pose along the y axis.
+            while True:
+                if hasattr(self, "matched_object"):
+                    self.x_error = (actionNoun_info[GoalAction.matched_object][0]-self.amcl_poses[0])
+                    self.y_error = (actionNoun_info[GoalAction.matched_object][1]-self.amcl_poses[1])
+                    self.y_offset = -0.22 if self.y_error > 0.0 else 0.22
+                    break
             
 class ControlTrajectory:
     def __init__(self):
@@ -296,140 +398,197 @@ class ControlTrajectory:
         self.move_gripper = MoveGroupCommander(GROUP_GRIPPER)
         self.gripper_pub = rospy.Publisher("/gripper_controller/command", JointTrajectory, queue_size=10)
         self.move_gripper.set_pose_reference_frame(GLOBAL_FRAME)
-        self.move_arm.set_pose_reference_frame(GLOBAL_FRAME)
+        self.move_gripper.set_goal_position_tolerance(GOAL_POSITION_TOLERANCE)
+        self.move_arm.set_pose_reference_frame(NAVIGATION_FRAME)
         self.move_arm.set_goal_position_tolerance(GOAL_POSITION_TOLERANCE)
         self.move_arm.go(HOME_CONFIG)
         self.move_arm.stop()
         self.move_arm.clear_pose_targets()
-        self.move_gripper.go(GRIPPER_OPEN, wait=False)
+        self.listener = tf.TransformListener()
+        self.move_gripper.go(GRIPPER_OPEN, wait=True)
         self.move_gripper.stop()
         self.move_gripper.clear_pose_targets()
-        self.listener = tf.TransformListener()
-
         rospy.loginfo("Init Complete")
 
-    def transform_baseframe(self, pose):
-        self.listener.waitForTransform("world", "base_footprint", rospy.Time(), rospy.Duration(4.0))
-        self.pose_pretransform = PoseStamped()
-        self.pose_pretransform.header.frame_id = "base_footprint"
-        self.pose_pretransform.header.stamp = rospy.Time(0)
-        self.pose_pretransform.pose = pose
-        pose_world = self.listener.transformPose("world", self.pose_pretransform)
+    def transform_to_base(self, pose):
+        self.listener.waitForTransform("base_footprint", "map", rospy.Time(), rospy.Duration(4.0))
+        pose_pretransform = PoseStamped()
+        pose_pretransform.header.frame_id = "map"
+        pose_pretransform.header.stamp = rospy.Time(0)
+        pose_pretransform.pose = pose
+        pose_base = self.listener.transformPose("base_footprint", pose_pretransform)
+        print(pose_base)
+        return pose_base
 
-        return pose_world
+    def transform_to_odom(self, pose):
+        self.listener.waitForTransform("odom", "base_footprint", rospy.Time(), rospy.Duration(4.0))
+        pose_pretransform = PoseStamped()
+        pose_pretransform.header.frame_id = "base_footprint"
+        pose_pretransform.header.stamp = rospy.Time(0)
+        pose_pretransform.pose = pose
+        pose_map = self.listener.transformPose("odom", pose_pretransform)
+        return pose_map    
 
     def grabObject(self, item):
         waypoints = []
-        goal_status = False
-        state = ENTRY
-
+        state = PREP
+        MAX_WAYPOINTS = 0
         GoalAction.setObjectInfo()
-        x_pose = actionNoun_info[item][0]
-        y_pose = actionNoun_info[item][1]
-        z_pose = actionNoun_info[item][2]
 
-        while goal_status is not True:
-            while state is ENTRY:
-                transformed_pose_entry = self.transform_baseframe(self.move_arm.get_current_pose().pose)
-                transformed_pose_entry = transformed_pose_entry.pose
-                x_pose_error = round((x_pose-transformed_pose_entry.position.x), 4)
-                y_pose_error = round(((y_pose+EE_TO_GRIPPERLINK_DIST)-transformed_pose_entry.position.y), 4)
-                transformed_pose_entry.position.x += x_pose_error
-                transformed_pose_entry.position.y += y_pose_error
-                waypoints.append(copy.deepcopy(transformed_pose_entry))
-                
-                if abs(x_pose_error) < 0.005:
-                    state = ORIENT
-                    self.move_arm.stop()
-                    self.move_arm.clear_pose_targets()
-                    rospy.sleep(2.0)
-                    break
+        if state == PREP:
+            self.obj_pose = Pose()
+            self.obj_pose.position.x = actionNoun_info[item][0]
+            self.obj_pose.position.y = actionNoun_info[item][1]
+            self.obj_pose.position.z = actionNoun_info[item][2]
+            base_relative_objpose = self.transform_to_base(self.obj_pose)
+            y_pose = base_relative_objpose.pose.position.y
 
+            try:
+                if y_pose > 0:
+                    self.move_arm.go(LEFT_PICKUP, wait=True)
+                    self.obj_pose.position.y += EE_TO_GRIPPERLINK_DIST
+                elif y_pose < 0:
+                    self.move_arm.go(RIGHT_PICKUP, wait=True)
+                    self.obj_pose.position.y -= EE_TO_GRIPPERLINK_DIST
+            except RuntimeError as object_pose_error:
+                    rospy.logwarn(object_pose_error)
+            else:
+                state = ENTRY
+
+        if state == ENTRY:
+            init_pose = self.move_arm.get_current_pose().pose
+            while True:
+                init_pose.position.x = self.obj_pose.position.x
+                init_pose.position.y = self.obj_pose.position.y
+                waypoints.append(copy.deepcopy(init_pose))
+                if len(waypoints) >= 50:
+                    self.curr_entrypose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose.position
+                    self.x_pose_error = self.obj_pose.position.x-self.curr_entrypose.x
+                    self.y_pose_error = self.obj_pose.position.y-self.curr_entrypose.y
+                    print(f"x error: {self.x_pose_error}")
+                    print(f"y error: {self.y_pose_error}")
+                    if (abs(self.x_pose_error) < 0.01) and (abs(self.y_pose_error) < 0.01):
+                        state = ORIENT
+                        self.move_arm.stop()
+                        self.move_arm.clear_pose_targets()
+                        waypoints.clear()
+                        break
+                (plan, fraction) = self.move_arm.compute_cartesian_path(waypoints, 0.0075)
+                self.move_arm.execute(plan, wait=False)      
+                rospy.sleep(0.1)
+                if rospy.is_shutdown():
+                    break            
+
+        if state == ORIENT:
+            place_config = self.move_arm.get_current_joint_values()
+            place_config[3] = 0.95
+            self.move_arm.go(place_config, wait=True)
+            state = DESCEND
+
+        if state == DESCEND:
+            descent_pose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose
+            while True:
+                descent_pose.position.z = self.obj_pose.position.z
+                waypoints.append(copy.deepcopy(descent_pose))
+                if len(waypoints) >= 10:
+                    self.curr_descendpose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose.position.z
+                    self.z_pose_error = self.obj_pose.position.z-self.curr_descendpose
+                    print(self.z_pose_error)
+                    if (abs(self.z_pose_error) < 0.024):
+                        state = OBTAIN
+                        self.move_arm.stop()
+                        self.move_arm.clear_pose_targets()
+                        waypoints.clear()
+                        break
+                (plan, fraction) = self.move_arm.compute_cartesian_path(waypoints, 0.01)
+                self.move_arm.execute(plan, wait=False)      
+                rospy.sleep(0.1)
+                if rospy.is_shutdown():
+                    break    
+            
+        if state == OBTAIN:
+            self.move_arm.stop()
+            rospy.loginfo("CLOSING")
+            self.move_gripper.go(GRIPPER_CLOSE, wait=True)
+            rospy.sleep(1.5)
+            state = ASCEND
+
+        if state == ASCEND:
+            self.move_arm.go(TRANSIT_CONFIG, wait=True)  
+            rospy.sleep(2.0)
+            print("OBJECT ACQUIRED")
+            GoalAction.movetohome()
+            state = RETURN 
+        
+        if state == RETURN:
+            self.move_arm.go(RELEASE_CONFIG, wait=True)
+            descent_placepose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose
+            while True:
+                MAX_WAYPOINTS += 1
+                if MAX_WAYPOINTS % 5 == 0:
+                    self.curr_returnpose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose.position.z
+                    self.ee_curr_pose_z = self.obj_pose.position.z-self.curr_returnpose
+                    if (abs(self.ee_curr_pose_z) < 0.035):
+                        self.move_arm.stop()
+                        self.move_arm.clear_pose_targets()
+                        waypoints.clear()
+                        state = RELEASE
+                        break
+                descent_placepose.position.z = 0.025
+                waypoints.append(copy.deepcopy(descent_placepose))
+                (plan, fraction) = self.move_arm.compute_cartesian_path(waypoints, 0.01)
+                self.move_arm.execute(plan, wait=False)      
+                rospy.sleep(0.05)
                 if rospy.is_shutdown():
                     break
-
-                (plan, fraction) = self.move_arm.compute_cartesian_path(waypoints, ARM_TRAJECTORY_WAYPOINT_STEP)
-                self.move_arm.execute(plan, wait=False)
-                waypoints.clear()
-                rospy.sleep(0.03)
-            
-            if state is ORIENT:
-                place_config = self.move_arm.get_current_joint_values()
-                place_config[3] = 1.575
-                self.move_arm.go(place_config, wait=True)
-                state = DESCEND
-                waypoints.clear()
-
-            while state is DESCEND:
-                transformed_pose_descend = self.transform_baseframe(self.move_arm.get_current_pose().pose)
-                z_pose_error = (round((z_pose-transformed_pose_descend.pose.position.z), 4)) + 0.01
-                print(z_pose_error)
-                transformed_pose_descend.pose.position.z += (z_pose_error*0.5)
-                waypoints.append(copy.deepcopy(transformed_pose_descend))
-                
-                if abs(z_pose_error) < 0.02:
-                    print("LOCATED")
-                    state = OBTAIN
-                    break
-
-                if rospy.is_shutdown():
-                    break
-
-                (plan, fraction) = self.move_arm.compute_cartesian_path(waypoints, ARM_TRAJECTORY_WAYPOINT_STEP)
-                self.move_arm.execute(plan, wait=False)
-                waypoints.clear()
-                rospy.sleep(0.03)
-            
-            if state is OBTAIN:
-                self.move_arm.stop()
-                print("CLOSING")
-                self.move_gripper.go(GRIPPER_CLOSE, wait=True)
-                rospy.sleep(2.0)
-                state = ASCEND
-
-            if state is ASCEND:
-                self.move_arm.go(TRANSIT_CONFIG, wait=True)  
-                rospy.sleep(2.0)
-                print("OBJECT ACQUIRED")
-                Navigate.movetohome()
-                break
-
-
-            if rospy.is_shutdown():
-                break
+        
+        if state == RELEASE:
+            self.move_gripper.go(GRIPPER_OPEN, wait=True)
+            rospy.sleep(1.0)
+            self.move_arm.go(HOME_CONFIG, wait=True)
+            rospy.sleep(1.0)
+            self.move_arm.stop()
+            self.move_gripper.stop()
+            self.move_arm.clear_pose_targets()
+            self.move_gripper.clear_pose_targets()
+            state = None
 
 class TaskThreader:
     def __init__(self):
         pass
-
-    def acquire_base_status(self):
-        self.move_base_status = base_client.get_state()
     
     def start_SpeakBot(self):
         # Start Speakbot
+        GoalAction.setObjectInfo()
         while not rospy.is_shutdown():
-            GoalAction.setObjectInfo()
-            # GoalAction.movetotarget(GoalAction.result_string, GoalAction.result_tuple)
             UserCommand.RecordAudio()
+            #UserCommand.SummariseRequest(UserCommand.request)
+            #GoalAction.movetotarget(UserCommand.result, UserCommand.result_period)
+            # GoalAction.movetotarget(GoalAction.result_string, GoalAction.result_tuple)
+            # #rospy.sleep(1.0)            
+            # #ControlArm.grabObject("green block")
+            # GoalAction.running_status = False
+            # UserCommand.find_action = False
 
     def start_ProximitySens(self):
-        rospy.Subscriber("/scan", LaserScan, SpeakBot_Thread.process_Scanner)
+        rospy.Subscriber("/scan", LaserScan, self.process_Scanner)
         rospy.spin()
 
     def process_Scanner(self, scan):
-        SpeakBot_Thread.acquire_base_status()
         lowest_val = sorted(scan.ranges)[:5]
-        lowest_val = round((stats.mean(lowest_val)), 3)
-        
-        if lowest_val < 0.4 and self.move_base_status == 0:
-            print("OBJECT DETECTED WHILST STATIC")
-        else:
-            pass
 
-if __name__ == '__main__':
-    rospy.init_node("transcribe")
+        # The mean distance recorded is used instead of the minimum to mitigate anomalies in the sensor readings.
+        lowest_val = round((stats.mean(lowest_val)), 3)
+
+        if hasattr(GoalAction, "running_status"):
+            if lowest_val < 0.5 and GoalAction.running_status is False:
+                rospy.loginfo("OBJECT DETECTED WHILST STATIC")
+            else:
+                pass
+
+if __name__ == '__main__': 
+    rospy.init_node("speakbot")
     moveit_commander.roscpp_initialize(sys.argv)
-    whisper_model = whisper.load_model("base.en")
     UserCommand = GetInstruction()
     GoalAction = Navigate()
     ControlArm = ControlTrajectory()
@@ -453,6 +612,10 @@ if __name__ == '__main__':
     SpeakBot = threading.Thread(target=SpeakBot_Thread.start_SpeakBot)
     Proximity_Sensor = threading.Thread(target=SpeakBot_Thread.start_ProximitySens)
 
+    rospy.set_param("/move_base/DWAPlannerROS/xy_goal_tolerance", 0.04)
+    rospy.set_param("/move_base/DWAPlannerROS/yaw_goal_tolerance", 0.08)
+    rospy.set_param("/move_base/DWAPlannerROS/path_distance_bias", 5.0)
+    rospy.set_param("/move_base/DWAPlannerROS/max_vel_trans", 0.26)
     SpeakBot.start()
-    Proximity_Sensor.setDaemon(True)
-    Proximity_Sensor.start()
+    # Proximity_Sensor.setDaemon(True)
+    # Proximity_Sensor.start()
