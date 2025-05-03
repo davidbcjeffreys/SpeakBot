@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-
+#
 # SpeakBot.py
 #
-# Author: David Jeffreys (P2655839)
+# Author:   David Jeffreys
+# Date:     3/5/2025
+# Version:  1.1
 #
 # Acquires audio input from a microphone peripheral through PyAudio, transcribes the audio file utilising Whisper local 'base' model, and processes the transcribed text within a DetermineAction class
 # (toolkit), enabling generation of output parameters that are deferenced effectively by the altered_teleop_twist_keyboard.py Python module. End-effector pose manipulation and mobile base localization 
@@ -31,7 +33,7 @@ from sensor_msgs.msg import LaserScan
 
 # !!!!!!!!!! REMINDER TO UPDATE PACKAGE.XML FOR THE ABOVE DEPENDENCIES !!!!!!!!!!  #
 
-OPENAT_API_KEY = os.getenv("OPENAI_API_KEY")
+#OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # move_group group's and global frame declarations
 GLOBAL_FRAME = "map"
@@ -193,18 +195,6 @@ class GetInstruction:
 
         self.final_request_str = split_summary[0]
         self.final_request_tupl = tuple(self.final_request_str.split())
-
-        # with open("Summarisation_Layer.html", "a") as doc:
-        #     doc.write("<p style='color:rgb(0, 0, 83);'>Input audio category: Bkgrd Noise (Normal)</p>")
-        #     doc.write("<p style='color:rgb(0, 0, 83);'>Input audio approx distance: 1.0</p>")
-        #     doc.write(f"<p style='color:rgb(0, 0, 83);'>Number of re-listens required: {self.listening_count}</p>")
-        #     doc.write(f"<p style='color:gray;'>Input Transcription: {self.transcription}</p>")
-        #     doc.write(f"<p style='color:red;'>Response: {self.final_request_str}</p>")
-        #     doc.write(f"<p style='color:red;'>Urgency: {split_summary[1]}</p>\n")
-        #     doc.write("<br>\n")
-        #     doc.close()
-        
-        # self.start_time = rospy.Time.now().secs
         GoalAction.movetotarget(self.final_request_str, self.final_request_tupl)
 
     def reconfigure_params_fast(self):
@@ -226,8 +216,8 @@ class GetInstruction:
         DWAPlanner_client = Client("/move_base/DWAPlannerROS")
         DWAparams = {
             "xy_goal_tolerance" : 0.05,
-            "yaw_goal_tolerance" : 0.07,
-            "path_distance_bias" : 16,
+            "yaw_goal_tolerance" : 0.09,
+            "path_distance_bias" : 32,
             "max_vel_trans" : 0.18,
         }
         inflation_layer_client = Client("/move_base/local_costmap/inflation_layer")
@@ -318,7 +308,7 @@ class Navigate:
                     break
                 if self.matched_object:
                     self.matched_object = self.matched_object.group()
-                    rospy.sleep(2.0)                                        # Once initiated, the /amcl_pose topic publishes at a low frequency of approx. 0.66Hz. Unless there is a way to adjust this publishing frequency, a rudimentary 'buffer' must be implemented - a timer to allow the callback function to acquire the value.
+                                                        # Once initiated, the /amcl_pose topic publishes at a low frequency of approx. 0.66Hz. Unless there is a way to adjust this publishing frequency, a rudimentary 'buffer' must be implemented - a timer to allow the callback function to acquire the value.
                     if self.matched_object in actionNoun.keys():
                         self.orient_vals = self.base_orient()
                         self.wafflepose_locate.pose.position.x = actionNoun_info[self.matched_object][0] + self.orient_vals[0]
@@ -361,6 +351,11 @@ class Navigate:
     def base_orient(self):
     # Orientates the Waffle Pi based on current positional error between the mobile base and the target.
     # item with respect to the x axis.
+
+        self.x_error = (actionNoun_info[self.matched_object][0]-self.amcl_poses[0])
+        self.y_error = (actionNoun_info[self.matched_object][1]-self.amcl_poses[1])
+        self.y_offset = -0.22 if self.y_error > 0.0 else 0.22
+
         if self.x_error > 0:
             self.x_location = LINK1_TO_BASEINK_DIST
             self.z_orient = 0.0
@@ -381,16 +376,16 @@ class Navigate:
                 self.amcl_poses[0] = amcl_pose.pose.position.x
                 self.amcl_poses[1] = amcl_pose.pose.position.y
 
-            rospy.logdebug("AMCL RUNNING")
+            # rospy.logdebug("AMCL RUNNING")
             # Error checking is undertaken between the Pi pose and the assumed 
             # object pose within the global frame, setting an offset for the
             # target object pose along the y axis.
-            while True:
-                if hasattr(self, "matched_object"):
-                    self.x_error = (actionNoun_info[GoalAction.matched_object][0]-self.amcl_poses[0])
-                    self.y_error = (actionNoun_info[GoalAction.matched_object][1]-self.amcl_poses[1])
-                    self.y_offset = -0.22 if self.y_error > 0.0 else 0.22
-                    break
+            # while True:
+            #     if hasattr(self, "matched_object"):
+            #         self.x_error = (actionNoun_info[GoalAction.matched_object][0]-self.amcl_poses[0])
+            #         self.y_error = (actionNoun_info[GoalAction.matched_object][1]-self.amcl_poses[1])
+            #         self.y_offset = -0.22 if self.y_error > 0.0 else 0.22
+            #         break
             
 class ControlTrajectory:
     def __init__(self):
@@ -494,7 +489,7 @@ class ControlTrajectory:
                     self.curr_descendpose = self.transform_to_odom(self.move_arm.get_current_pose().pose).pose.position.z
                     self.z_pose_error = self.obj_pose.position.z-self.curr_descendpose
                     print(self.z_pose_error)
-                    if (abs(self.z_pose_error) < 0.024):
+                    if (abs(self.z_pose_error) < 0.022):
                         state = OBTAIN
                         self.move_arm.stop()
                         self.move_arm.clear_pose_targets()
@@ -617,5 +612,5 @@ if __name__ == '__main__':
     rospy.set_param("/move_base/DWAPlannerROS/path_distance_bias", 5.0)
     rospy.set_param("/move_base/DWAPlannerROS/max_vel_trans", 0.26)
     SpeakBot.start()
-    # Proximity_Sensor.setDaemon(True)
-    # Proximity_Sensor.start()
+    Proximity_Sensor.setDaemon(True)
+    Proximity_Sensor.start()
