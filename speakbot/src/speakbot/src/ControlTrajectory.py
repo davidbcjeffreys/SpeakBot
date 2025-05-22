@@ -63,7 +63,7 @@ class ControlTrajectory:
         self.move_gripper.go(GRIPPER_OPEN, wait=True)
         self.move_gripper.stop()
         self.move_gripper.clear_pose_targets()
-        rospy.loginfo("Init Complete")
+        rospy.loginfo("Manipulator initialization complete")
     
     def getObjects(self, navigation_obj):
         self.Navigate = navigation_obj
