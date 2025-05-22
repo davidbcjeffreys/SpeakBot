@@ -1,4 +1,4 @@
-<launch>
-  <!-- launch transcription node -->
+<!-- <launch>
+ launch transcription node
   <node pkg="speakbot" type="Transcription.py" name="SpeakBot_Transcription" output="screen" launch-prefix="gnome-terminal --"/>
-</launch>
+</launch> --!>
