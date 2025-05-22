@@ -1,0 +1,9 @@
+<launch>  
+  <!-- start Gazebo node -->
+  <include file="$(find turtlebot3_manipulation_gazebo)/launch/turtlebot3_manipulation_gazebo.launch">
+  </include>
+  
+  <!-- start navigation node -->
+  <include file="$(find turtlebot3_manipulation_navigation)/launch/navigation.launch">
+  </include>
+</launch>
