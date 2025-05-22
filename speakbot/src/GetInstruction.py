@@ -151,7 +151,6 @@ class GetInstruction:
         self.DWAPlanner_client.update_configuration(self.DWAparams)
         self.final_request_str = split_summary[0]
         self.final_request_tupl = tuple(self.final_request_str.split())
-        rospy.loginfo(self.final_request_str)
         self.Navigate.movetotarget(self.final_request_str, self.final_request_tupl)
 
     """Enables dynamic reconfiguration of the DWA ROS Planner parameters based on user request urgency."""
