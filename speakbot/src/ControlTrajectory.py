@@ -46,7 +46,7 @@ RELEASE = 7
 
 class ControlTrajectory:
     """
-    Controls trajectory planning and control of the attached 5DOF arm
+    Controls trajectory planning and control of the attached 6DOF arm
     """
     def __init__(self):
         """Initialises MoveGroupCommander for the robotic arm, setting the arm in a sane (home) config."""
